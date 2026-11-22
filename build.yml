@@ -1,0 +1,64 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install packages
+        run: npm install
+
+      - name: Prepare web files
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Add Bluetooth permissions
+        run: |
+          F=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.BLUETOOTH" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />#' $F
+          grep -q BLUETOOTH_CONNECT $F
+          cat $F
+
+      - name: Add permission request to the app
+        run: cp MainActivity.java android/app/src/main/java/com/example/radar/MainActivity.java
+
+      - name: Sync plugins
+        run: npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "build-${{ github.run_number }}" \
+            android/app/build/outputs/apk/debug/app-debug.apk \
+            --title "Radar build ${{ github.run_number }}" \
+            --notes "Debug APK"
