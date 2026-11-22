@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Radar</title>
+<style>
+  :root {
+    --bg: #04141a;
+    --ring: #14505c;
+    --ring-text: #3f8f9c;
+    --danger: 255, 82, 82;
+    --text: #cdeff3;
+    --panel: #0f3a44;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: env(safe-area-inset-top, 24px) 0 env(safe-area-inset-bottom, 0px);
+  }
+  #bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    font-size: 20px;
+    font-weight: 600;
+  }
+  button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--ring);
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 16px;
+  }
+  canvas {
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    display: block;
+  }
+  #status {
+    text-align: center;
+    padding: 10px 12px 4px;
+    font-size: 17px;
+    font-weight: 600;
+    min-height: 36px;
+  }
+  #status.danger { color: rgb(var(--danger)); }
+  #readout {
+    display: flex;
+    justify-content: space-around;
+    padding: 6px 12px 14px;
+    font-size: 16px;
+    color: var(--ring-text);
+  }
+  #readout b { color: var(--text); font-size: 22px; font-weight: 600; }
+  #list {
+    display: none;
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(4, 20, 26, 0.97);
+    padding: 70px 16px 16px;
+    overflow: auto;
+  }
+  #list button {
+    display: block;
+    width: 100%;
+    margin-bottom: 10px;
+    text-align: left;
+  }
+  #list small { color: var(--ring-text); display: block; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <span>Radar</span>
+    <button id="btn">Connect</button>
+  </div>
+  <canvas id="c"></canvas>
+  <div id="status">Not connected</div>
+  <div id="readout">
+    <span>Angle <b id="a">--</b>&deg;</span>
+    <span>Distance <b id="d">--</b> cm</span>
+  </div>
+</div>
+<div id="list"></div>
+
+<script>
+// ---- Settings (keep the same as your Arduino sketch) ----
+var MAX_DIST   = 100;   // cm
+var ALERT_DIST = 20;    // cm
+var FADE_MS    = 6000;  // how long a detected object stays on screen
+
+// ---- Elements and state ----
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var aEl = document.getElementById('a');
+var dEl = document.getElementById('d');
+var statusEl = document.getElementById('status');
+var btn = document.getElementById('btn');
+var listEl = document.getElementById('list');
+
+var W = 0, H = 0, cx = 0, cy = 0, R = 0;
+var points = {};          // angle -> { dist, t }
+var curAngle = 90;
+var dir = 1;
+var idleText = 'Scanning';
+var hasData = false;
+
+var BT = (window.Capacitor && window.Capacitor.Plugins)
+  ? window.Capacitor.Plugins.BluetoothSerial : null;
+var address = null;
+var readListener = null;
+
+function rad(deg) { return deg * Math.PI / 180; }
+
+function setStatus(text, danger) {
+  statusEl.textContent = text;
+  statusEl.className = danger ? 'danger' : '';
+}
+
+function errText(e) {
+  if (!e) return 'unknown error';
+  return e.message || e.errorMessage || JSON.stringify(e);
+}
+
+function resize() {
+  var dpr = window.devicePixelRatio || 1;
+  var rect = canvas.getBoundingClientRect();
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  W = rect.width;
+  H = rect.height;
+  R = Math.min(W / 2 - 18, H - 34);
+  cx = W / 2;
+  cy = H - 16;
+}
+
+// ---- Handle one line like "45,23" ----
+function handleLine(line) {
+  var p = String(line).trim().split(',');
+  if (p.length !== 2) return;
+  var ang = parseInt(p[0], 10);
+  var dist = parseInt(p[1], 10);
+  if (isNaN(ang) || isNaN(dist)) return;
+
+  hasData = true;
+  if (ang !== curAngle) dir = ang > curAngle ? 1 : -1;
+  curAngle = ang;
+  points[ang] = { dist: dist, t: performance.now() };
+
+  aEl.textContent = ang;
+  dEl.textContent = dist >= MAX_DIST ? '--' : dist;
+
+  if (dist < ALERT_DIST) {
+    setStatus('Object close: ' + dist + ' cm', true);
+  } else {
+    setStatus(idleText, false);
+  }
+}
+
+function handleData(value) {
+  String(value).split(/\r?\n/).forEach(handleLine);
+}
+
+// ---- Bluetooth ----
+function hideList() {
+  listEl.style.display = 'none';
+  listEl.innerHTML = '';
+}
+
+function showDevices(devices) {
+  listEl.innerHTML = '';
+  if (!devices.length) {
+    hideList();
+    setStatus('No devices found. Power the HC-05 and try again.', true);
+    return;
+  }
+  var title = document.createElement('div');
+  title.textContent = 'Choose your HC-05';
+  title.style.cssText = 'font-size:20px;font-weight:600;margin-bottom:14px';
+  listEl.appendChild(title);
+
+  devices.forEach(function (dev) {
+    var b = document.createElement('button');
+    b.innerHTML = (dev.name || 'Unnamed device') + '<small>' + dev.address + '</small>';
+    b.onclick = function () { connectTo(dev); };
+    listEl.appendChild(b);
+  });
+
+  var cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  cancel.onclick = function () { hideList(); setStatus('Not connected', false); };
+  listEl.appendChild(cancel);
+
+  listEl.style.display = 'block';
+  setStatus('Not connected', false);
+}
+
+async function startScan() {
+  try {
+    setStatus('Turning on Bluetooth...');
+    await BT.enable();
+    setStatus('Looking for devices (about 12 seconds)...');
+    var res = await BT.scan();
+    showDevices(res.devices || []);
+  } catch (e) {
+    setStatus('Error: ' + errText(e), true);
+  }
+}
+
+async function connectTo(dev) {
+  hideList();
+  setStatus('Connecting to ' + (dev.name || dev.address) + '...');
+  try {
+    try {
+      await BT.connect({ address: dev.address });
+    } catch (e1) {
+      await BT.connectInsecure({ address: dev.address });
+    }
+    address = dev.address;
+
+    if (!readListener) {
+      readListener = await BT.addListener('onRead', function (d) {
+        if (address) handleData(d.value || d.data || '');
+      });
+    }
+    await BT.startNotifications({ address: address, delimiter: '\n' });
+
+    btn.textContent = 'Disconnect';
+    idleText = 'Scanning';
+    setStatus('Connected. Waiting for data...');
+  } catch (e) {
+    address = null;
+    setStatus('Could not connect: ' + errText(e), true);
+  }
+}
+
+async function disconnectNow() {
+  var a = address;
+  address = null;
+  try { await BT.stopNotifications({ address: a }); } catch (e) {}
+  try { await BT.disconnect({ address: a }); } catch (e) {}
+  hasData = false;
+  points = {};
+  aEl.textContent = '--';
+  dEl.textContent = '--';
+  btn.textContent = 'Connect';
+  setStatus('Disconnected');
+}
+
+btn.onclick = function () {
+  if (!BT) { setStatus('Bluetooth is not available here (demo mode)', true); return; }
+  if (address) { disconnectNow(); } else { startScan(); }
+};
+
+// ---- Demo mode (only when opened in a normal browser) ----
+function startDemo() {
+  idleText = 'Demo mode (no Bluetooth)';
+  setStatus(idleText);
+  var a = 15, d = 1;
+  setInterval(function () {
+    a += 2 * d;
+    if (a >= 165) { a = 165; d = -1; }
+    if (a <= 15)  { a = 15;  d = 1; }
+    var dist = MAX_DIST;
+    if (a > 60 && a < 80) dist = 40;
+    if (a > 120 && a < 130) dist = 15;
+    handleLine(a + ',' + dist);
+  }, 50);
+}
+
+// ---- Drawing ----
+function drawGrid() {
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#14505c';
+  ctx.fillStyle = '#3f8f9c';
+  ctx.font = '12px system-ui, sans-serif';
+
+  for (var i = 1; i <= 4; i++) {
+    var r = R * i / 4;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
+    ctx.stroke();
+    ctx.fillText((MAX_DIST * i / 4) + ' cm', cx + r - 38, cy - 5);
+  }
+
+  for (var a = 0; a <= 180; a += 30) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.cos(rad(a)), cy - R * Math.sin(rad(a)));
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(cx - R, cy);
+  ctx.lineTo(cx + R, cy);
+  ctx.stroke();
+}
+
+function drawSweep() {
+  var steps = 26;
+  ctx.lineWidth = 3;
+  for (var i = steps; i >= 0; i--) {
+    var ang = curAngle - dir * i * 1.4;
+    var alpha = 0.32 * (1 - i / steps);
+    ctx.strokeStyle = 'rgba(90,220,235,' + alpha + ')';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.cos(rad(ang)), cy - R * Math.sin(rad(ang)));
+    ctx.stroke();
+  }
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgb(90,220,235)';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + R * Math.cos(rad(curAngle)), cy - R * Math.sin(rad(curAngle)));
+  ctx.stroke();
+}
+
+function drawBlips() {
+  var now = performance.now();
+  for (var k in points) {
+    var p = points[k];
+    var age = now - p.t;
+    if (age > FADE_MS) { delete points[k]; continue; }
+    if (p.dist >= MAX_DIST) continue;
+
+    var alpha = 1 - age / FADE_MS;
+    var r = R * p.dist / MAX_DIST;
+    var x = cx + r * Math.cos(rad(+k));
+    var y = cy - r * Math.sin(rad(+k));
+
+    ctx.fillStyle = p.dist < ALERT_DIST
+      ? 'rgba(255,82,82,' + alpha + ')'
+      : 'rgba(255,190,70,' + alpha + ')';
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+function frame() {
+  ctx.clearRect(0, 0, W, H);
+  drawGrid();
+  drawBlips();
+  if (hasData) drawSweep();
+  requestAnimationFrame(frame);
+}
+
+// ---- Start ----
+window.addEventListener('resize', resize);
+resize();
+if (!BT) startDemo();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
