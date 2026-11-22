@@ -123,7 +123,9 @@ var hasData = false;
 var BT = (window.Capacitor && window.Capacitor.Plugins)
   ? window.Capacitor.Plugins.BluetoothSerial : null;
 var address = null;
-var readListener = null;
+var rxBuffer = '';
+var totalBytes = 0;
+var polling = false;
 
 function rad(deg) { return deg * Math.PI / 180; }
 
@@ -173,8 +175,28 @@ function handleLine(line) {
   }
 }
 
-function handleData(value) {
-  String(value).split(/\r?\n/).forEach(handleLine);
+// Read whatever the HC-05 has sent, and split it into lines like "45,23"
+async function pollData() {
+  if (!BT || !address || polling) return;
+  polling = true;
+  try {
+    var res = await BT.read({ address: address });
+    var chunk = (res && (res.data || res.value)) || '';
+    if (chunk) {
+      totalBytes += chunk.length;
+      rxBuffer += chunk;
+      var parts = rxBuffer.split('\n');
+      rxBuffer = parts.pop();
+      for (var i = 0; i < parts.length; i++) handleLine(parts[i]);
+      if (rxBuffer.length > 200) rxBuffer = '';
+    }
+    if (!hasData) {
+      setStatus('Connected. Waiting for data... (' + totalBytes + ' bytes received)');
+    }
+  } catch (e) {
+    setStatus('Read error: ' + errText(e), true);
+  }
+  polling = false;
 }
 
 // ---- Bluetooth ----
@@ -233,13 +255,9 @@ async function connectTo(dev) {
       await BT.connectInsecure({ address: dev.address });
     }
     address = dev.address;
-
-    if (!readListener) {
-      readListener = await BT.addListener('onRead', function (d) {
-        if (address) handleData(d.value || d.data || '');
-      });
-    }
-    await BT.startNotifications({ address: address, delimiter: '\n' });
+    rxBuffer = '';
+    totalBytes = 0;
+    hasData = false;
 
     btn.textContent = 'Disconnect';
     idleText = 'Scanning';
@@ -253,7 +271,6 @@ async function connectTo(dev) {
 async function disconnectNow() {
   var a = address;
   address = null;
-  try { await BT.stopNotifications({ address: a }); } catch (e) {}
   try { await BT.disconnect({ address: a }); } catch (e) {}
   hasData = false;
   points = {};
@@ -365,6 +382,7 @@ function frame() {
 // ---- Start ----
 window.addEventListener('resize', resize);
 resize();
+setInterval(pollData, 40);
 if (!BT) startDemo();
 requestAnimationFrame(frame);
 </script>
